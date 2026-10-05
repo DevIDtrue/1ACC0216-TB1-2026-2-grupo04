@@ -1,0 +1,605 @@
+# ============================================================
+# FUNDAMENTOS DE DATA SCIENCE - TB1
+# Proyecto: Hotel Booking Demand
+# Preguntas de negocio asignadas
+# - 7. ¿Qué tan frecuente es la solicitud de estacionamiento y qué
+#      características presentan esas reservas?
+# - 8. ¿Qué patrones se observan en las reservas según canal de
+#      distribución, tipo de depósito o solicitudes especiales?
+# ============================================================
+
+# 1. Limpieza
+rm(list = ls(all = TRUE))
+graphics.off()
+cat("\014")
+
+# 2. Carga de librerias
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(e1071)
+
+# 3. Cargar dataset
+hotel_data <- read.csv("data/hotel_bookings_original.csv")
+
+# 4. Inspeccion Inicial
+names(hotel_data)
+dim(hotel_data)
+str(hotel_data)
+head(hotel_data)
+summary(hotel_data)
+
+# ============================================================
+# 3.1 CALIDAD DE DATOS
+# ============================================================
+
+variables_preguntas <- c("hotel", "is_canceled", "required_car_parking_spaces",
+                         "stays_in_weekend_nights", "stays_in_week_nights",
+                         "distribution_channel", "deposit_type",
+                         "total_of_special_requests")
+
+variables_apoyo <- c("arrival_date_month", "arrival_date_year", "reservation_status")
+
+
+# --- 3.1.1 Completitud ---
+
+# Faltantes en las variables de las preguntas y de apoyo
+empty_values <- c(" ", "", "na", "NA", "NULL", "Null", "null", "N/A", "-", "Undefined")
+
+faltantes <- hotel_data |>
+  select(all_of(c(variables_preguntas, variables_apoyo))) |>
+  summarise(across(everything(), ~ sum(is.na(.x) | as.character(.x) %in% empty_values))) |>
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "cantidad")
+
+print(faltantes)
+
+# distribution_channel: canal "Undefined"
+hotel_data |> count(distribution_channel, sort = TRUE)
+
+
+# --- 3.1.2 Unicidad ---
+
+# Reservas duplicadas
+total_duplicados <- sum(duplicated(hotel_data))
+
+unicidad_summary <- data.frame(
+  Metrica = c("Total de filas originales", "Registros duplicados exactos",
+              "Filas sin duplicados"),
+  Valor   = c(nrow(hotel_data), total_duplicados, nrow(hotel_data) - total_duplicados)
+)
+
+print(unicidad_summary)
+
+# Impacto de los duplicados en is_canceled y required_car_parking_spaces
+hotel_sin_duplicados <- distinct(hotel_data)
+
+impacto <- data.frame(
+  Indicador = c("Numero de reservas",
+                "Tasa de cancelacion (%)",
+                "Reservas con estacionamiento (%)"),
+  Con_duplicados = c(
+    nrow(hotel_data),
+    round(mean(hotel_data$is_canceled) * 100, 2),
+    round(mean(hotel_data$required_car_parking_spaces > 0) * 100, 2)),
+  Sin_duplicados = c(
+    nrow(hotel_sin_duplicados),
+    round(mean(hotel_sin_duplicados$is_canceled) * 100, 2),
+    round(mean(hotel_sin_duplicados$required_car_parking_spaces > 0) * 100, 2))
+)
+
+print(impacto)
+
+# deposit_type antes y despues de eliminar duplicados
+hotel_data |> count(deposit_type)
+hotel_sin_duplicados |> count(deposit_type)
+
+
+# --- 3.1.3 Consistencia ---
+
+# is_canceled vs reservation_status
+table(hotel_data$is_canceled, hotel_data$reservation_status)
+
+# distribution_channel: agencia online registrada como Direct
+hotel_data |>
+  filter(market_segment == "Online TA", distribution_channel == "Direct") |>
+  nrow()
+
+
+# --- 3.1.4 Validez ---
+
+# hotel y deposit_type fuera de catalogo
+catalogo_hotel    <- c("City Hotel", "Resort Hotel")
+catalogo_deposito <- c("No Deposit", "Non Refund", "Refundable")
+
+hotel_data |> filter(!(hotel %in% catalogo_hotel)) |> nrow()
+hotel_data |> filter(!(deposit_type %in% catalogo_deposito)) |> nrow()
+
+# Valores posibles de is_canceled, total_of_special_requests y arrival_date_year
+hotel_data |> count(is_canceled)
+hotel_data |> count(total_of_special_requests)
+hotel_data |> count(arrival_date_year)
+
+# stays_in_weekend_nights + stays_in_week_nights: reservas con 0 noches
+hotel_data |>
+  filter(stays_in_weekend_nights + stays_in_week_nights == 0) |>
+  nrow()
+
+# required_car_parking_spaces: valores y casos con mas de 3 plazas
+hotel_data |> count(required_car_parking_spaces)
+
+hotel_data |>
+  filter(required_car_parking_spaces > 3) |>
+  select(hotel, adults, children, required_car_parking_spaces)
+
+# arrival_date_month: valores y tipo de dato
+hotel_data |> count(arrival_date_month)
+class(hotel_data$arrival_date_month)
+
+# Fechas de llegada que no existen
+hotel_fechas <- hotel_data |>
+  mutate(fecha_llegada = mdy(paste(arrival_date_month,
+                                   arrival_date_day_of_month,
+                                   arrival_date_year)))
+
+sum(is.na(hotel_fechas$fecha_llegada))
+
+
+# --- 3.1.5 Exactitud ---
+
+# required_car_parking_spaces vs is_canceled
+hotel_data |>
+  filter(required_car_parking_spaces > 0) |>
+  count(is_canceled)
+
+# deposit_type vs is_canceled
+hotel_data |>
+  group_by(deposit_type) |>
+  summarise(
+    reservas = n(),
+    tasa_cancelacion = round(mean(is_canceled) * 100, 2)
+  )
+
+
+# ============================================================
+# 3.2 PREPARACION Y TRANSFORMACION
+# hotel_data no se modifica; los cambios se aplican en hotel_limpio
+# ============================================================
+
+# --- Unicidad: eliminar duplicados ---
+print("=== ANTES ===")
+nrow(hotel_data)
+
+hotel_limpio <- hotel_data |>
+  distinct()
+
+print("=== DESPUES ===")
+nrow(hotel_limpio)
+
+
+# --- Completitud: "Undefined" en distribution_channel pasa a NA ---
+print("=== ANTES ===")
+hotel_limpio |> count(distribution_channel)
+
+hotel_limpio <- hotel_limpio |>
+  mutate(distribution_channel = na_if(distribution_channel, "Undefined"))
+
+print("=== DESPUES ===")
+hotel_limpio |> count(distribution_channel)
+
+
+# --- Validez: arrival_date_month a factor ordenado ---
+print("=== ANTES ===")
+class(hotel_limpio$arrival_date_month)
+
+hotel_limpio <- hotel_limpio |>
+  mutate(arrival_date_month = factor(arrival_date_month,
+                                     levels = month.name,
+                                     ordered = TRUE))
+
+print("=== DESPUES ===")
+class(hotel_limpio$arrival_date_month)
+levels(hotel_limpio$arrival_date_month)
+
+# Reservas con 0 noches: se mantienen (posible uso de dia)
+hotel_limpio |>
+  filter(stays_in_weekend_nights + stays_in_week_nights == 0) |>
+  nrow()
+
+# Reservas con 8 plazas de parking: se mantienen y se revisan en 3.4
+
+# Consistencia y exactitud: no se modifican, se documentan como limitaciones
+
+
+# --- Conversiones de tipo (seccion 2.3) ---
+hotel_limpio <- hotel_limpio |>
+  mutate(
+    hotel                = factor(hotel),
+    distribution_channel = factor(distribution_channel),
+    deposit_type         = factor(deposit_type)
+  )
+
+# is_canceled con etiquetas (se conserva is_canceled 0/1 para las tasas)
+hotel_limpio <- hotel_limpio |>
+  mutate(estado_reserva = factor(is_canceled,
+                                 levels = c(0, 1),
+                                 labels = c("No cancelada", "Cancelada")))
+
+hotel_limpio |> count(is_canceled, estado_reserva)
+
+
+# --- Nuevas variables: noches_totales y tiene_parking ---
+hotel_limpio <- hotel_limpio |>
+  mutate(
+    noches_totales = stays_in_weekend_nights + stays_in_week_nights,
+    tiene_parking  = factor(if_else(required_car_parking_spaces > 0, "Si", "No"),
+                            levels = c("No", "Si"))
+  )
+
+hotel_limpio |>
+  select(stays_in_weekend_nights, stays_in_week_nights, noches_totales,
+         required_car_parking_spaces, tiene_parking) |>
+  head()
+
+hotel_limpio |> count(tiene_parking)
+summary(hotel_limpio$noches_totales)
+
+
+# --- Verificacion final y guardado ---
+hotel_limpio |>
+  select(all_of(variables_preguntas), arrival_date_month, arrival_date_year,
+         estado_reserva, noches_totales, tiene_parking) |>
+  str()
+
+write_csv(hotel_limpio, "data/hotel_bookings_preparado.csv")
+
+list.files("data/", pattern = "preparado")
+
+# Carpeta para guardar los graficos
+dir.create("output/graficos", recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# 3.3 ANALISIS UNIVARIADO
+# ============================================================
+
+# --- is_canceled (estado_reserva) ---
+hotel_limpio |>
+  count(estado_reserva) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2))
+
+g_cancelacion <- hotel_limpio |>
+  count(estado_reserva) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2)) |>
+  ggplot(aes(x = estado_reserva, y = n)) +
+  geom_col(fill = "#2C7FB8") +
+  geom_text(aes(label = paste0(n, " (", porcentaje, "%)")), vjust = -0.3) +
+  labs(title = "Reservas segun estado de cancelacion",
+       x = "Estado de la reserva", y = "Numero de reservas") +
+  theme_minimal()
+g_cancelacion
+ggsave("output/gráficos/01_estado_reserva.png", g_cancelacion, width = 9, height = 6, dpi = 300)
+
+
+# --- tiene_parking ---
+hotel_limpio |>
+  count(tiene_parking) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2))
+
+g_parking <- hotel_limpio |>
+  count(tiene_parking) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2)) |>
+  ggplot(aes(x = tiene_parking, y = n)) +
+  geom_col(fill = "#41AB5D") +
+  geom_text(aes(label = paste0(n, " (", porcentaje, "%)")), vjust = -0.3) +
+  labs(title = "Reservas que solicitan estacionamiento",
+       x = "Solicita estacionamiento", y = "Numero de reservas") +
+  theme_minimal()
+g_parking
+ggsave("output/gráficos/02_tiene_parking.png", g_parking, width = 9, height = 6, dpi = 300)
+
+
+# --- noches_totales ---
+resumen_noches <- hotel_limpio |>
+  summarise(
+    media    = round(mean(noches_totales), 2),
+    mediana  = median(noches_totales),
+    desv_est = round(sd(noches_totales), 2),
+    minimo   = min(noches_totales),
+    maximo   = max(noches_totales)
+  )
+as.data.frame(t(resumen_noches))
+
+round(skewness(hotel_limpio$noches_totales, type = 2), 2)
+
+g_noches <- ggplot(hotel_limpio, aes(x = noches_totales)) +
+  geom_histogram(binwidth = 1, fill = "#2C7FB8", color = "white") +
+  coord_cartesian(xlim = c(0, 20)) +
+  labs(title = "Distribucion de la duracion total de la estancia",
+       x = "Noches totales", y = "Numero de reservas") +
+  theme_minimal()
+g_noches
+ggsave("output/gráficos/03_noches_totales.png", g_noches, width = 9, height = 6, dpi = 300)
+
+
+# --- hotel ---
+hotel_limpio |>
+  count(hotel) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2))
+
+
+# --- distribution_channel ---
+hotel_limpio |>
+  filter(!is.na(distribution_channel)) |>
+  count(distribution_channel, sort = TRUE) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2))
+
+g_canal <- hotel_limpio |>
+  filter(!is.na(distribution_channel)) |>
+  count(distribution_channel) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2)) |>
+  ggplot(aes(x = reorder(distribution_channel, n), y = n)) +
+  geom_col(fill = "#9ECAE1") +
+  geom_text(aes(label = paste0(n, " (", porcentaje, "%)")), hjust = -0.1) +
+  coord_flip() +
+  expand_limits(y = 85000) +
+  labs(title = "Reservas por canal de distribucion",
+       x = "Canal de distribucion", y = "Numero de reservas") +
+  theme_minimal()
+g_canal
+ggsave("output/gráficos/04_canal.png", g_canal, width = 9, height = 6, dpi = 300)
+
+
+# --- deposit_type ---
+hotel_limpio |>
+  count(deposit_type) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2))
+
+g_deposito <- hotel_limpio |>
+  count(deposit_type) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2)) |>
+  ggplot(aes(x = reorder(deposit_type, n), y = n)) +
+  geom_col(fill = "#E67E22") +
+  geom_text(aes(label = paste0(n, " (", porcentaje, "%)")), hjust = -0.1) +
+  coord_flip() +
+  expand_limits(y = 105000) +
+  labs(title = "Reservas por tipo de deposito",
+       x = "Tipo de deposito", y = "Numero de reservas") +
+  theme_minimal()
+g_deposito
+ggsave("output/gráficos/05_deposito.png", g_deposito, width = 9, height = 6, dpi = 300)
+
+
+# --- total_of_special_requests ---
+hotel_limpio |>
+  count(total_of_special_requests) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2))
+
+hotel_limpio |>
+  summarise(media = round(mean(total_of_special_requests), 2),
+            mediana = median(total_of_special_requests))
+
+g_solicitudes <- hotel_limpio |>
+  count(total_of_special_requests) |>
+  ggplot(aes(x = factor(total_of_special_requests), y = n)) +
+  geom_col(fill = "#8E44AD") +
+  geom_text(aes(label = n), vjust = -0.3) +
+  labs(title = "Reservas segun numero de solicitudes especiales",
+       x = "Solicitudes especiales", y = "Numero de reservas") +
+  theme_minimal()
+g_solicitudes
+ggsave("output/gráficos/06_solicitudes.png", g_solicitudes, width = 9, height = 6, dpi = 300)
+
+
+# ============================================================
+# 3.4 VALORES ATIPICOS
+# ============================================================
+
+# --- noches_totales: boxplot y regla 1.5 x RIC ---
+g_box_noches <- ggplot(hotel_limpio, aes(y = noches_totales)) +
+  geom_boxplot(fill = "#9ECAE1") +
+  labs(title = "Posibles valores atipicos en la duracion de la estancia",
+       y = "Noches totales", x = NULL) +
+  theme_minimal()
+g_box_noches
+ggsave("output/gráficos/07_boxplot_noches.png", g_box_noches, width = 9, height = 6, dpi = 300)
+
+Q1_noches  <- quantile(hotel_limpio$noches_totales, 0.25)
+Q3_noches  <- quantile(hotel_limpio$noches_totales, 0.75)
+RIC_noches <- Q3_noches - Q1_noches
+limite_superior_noches <- Q3_noches + 1.5 * RIC_noches
+
+limite_superior_noches
+
+hotel_limpio |>
+  filter(noches_totales > limite_superior_noches) |>
+  nrow()
+
+hotel_limpio |>
+  filter(noches_totales > 30) |>
+  select(hotel, noches_totales, estado_reserva)
+
+# --- total_of_special_requests: regla 1.5 x RIC ---
+Q1_sol  <- quantile(hotel_limpio$total_of_special_requests, 0.25)
+Q3_sol  <- quantile(hotel_limpio$total_of_special_requests, 0.75)
+RIC_sol <- Q3_sol - Q1_sol
+limite_superior_sol <- Q3_sol + 1.5 * RIC_sol
+
+limite_superior_sol
+
+hotel_limpio |>
+  filter(total_of_special_requests > limite_superior_sol) |>
+  count(total_of_special_requests)
+
+# --- required_car_parking_spaces: casos extremos ---
+hotel_limpio |>
+  filter(required_car_parking_spaces > 3) |>
+  select(hotel, adults, children, required_car_parking_spaces)
+
+
+# ============================================================
+# 3.5 ANALISIS BIVARIADO Y MULTIVARIADO
+# ============================================================
+
+# --- Pregunta 1: tiene_parking vs hotel ---
+hotel_limpio |>
+  count(hotel, tiene_parking) |>
+  group_by(hotel) |>
+  mutate(porcentaje = round(n / sum(n) * 100, 2))
+
+g_parking_hotel <- ggplot(hotel_limpio, aes(x = hotel, fill = tiene_parking)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("No" = "#BDBDBD", "Si" = "#41AB5D")) +
+  labs(title = "Proporcion de reservas con estacionamiento segun tipo de hotel",
+       x = "Tipo de hotel", y = "Porcentaje de reservas", fill = "Parking") +
+  theme_minimal()
+g_parking_hotel
+ggsave("output/gráficos/08_parking_hotel.png", g_parking_hotel, width = 9, height = 6, dpi = 300)
+
+
+# --- Pregunta 1: tiene_parking vs noches_totales ---
+hotel_limpio |>
+  group_by(tiene_parking) |>
+  summarise(media = round(mean(noches_totales), 2),
+            mediana = median(noches_totales))
+
+hotel_limpio |>
+  group_by(hotel, tiene_parking) |>
+  summarise(mediana_noches = median(noches_totales), .groups = "drop")
+
+g_parking_noches <- ggplot(hotel_limpio, aes(x = tiene_parking, y = noches_totales, fill = tiene_parking)) +
+  geom_boxplot(show.legend = FALSE) +
+  coord_cartesian(ylim = c(0, 15)) +
+  facet_wrap(~ hotel) +
+  scale_fill_manual(values = c("No" = "#BDBDBD", "Si" = "#41AB5D")) +
+  labs(title = "Duracion de la estancia segun solicitud de estacionamiento",
+       x = "Solicita estacionamiento", y = "Noches totales") +
+  theme_minimal()
+g_parking_noches
+ggsave("output/gráficos/09_parking_noches.png", g_parking_noches, width = 9, height = 6, dpi = 300)
+
+
+# --- Pregunta 1: tiene_parking vs is_canceled ---
+hotel_limpio |>
+  group_by(tiene_parking) |>
+  summarise(reservas = n(),
+            tasa_cancelacion = round(mean(is_canceled) * 100, 2))
+
+
+# --- Pregunta 2: tasa de cancelacion por distribution_channel ---
+cancel_canal <- hotel_limpio |>
+  filter(!is.na(distribution_channel)) |>
+  group_by(distribution_channel) |>
+  summarise(reservas = n(),
+            tasa_cancelacion = round(mean(is_canceled) * 100, 2))
+cancel_canal
+
+g_cancel_canal <- ggplot(cancel_canal, aes(x = reorder(distribution_channel, tasa_cancelacion),
+                                           y = tasa_cancelacion)) +
+  geom_col(fill = "#2C7FB8") +
+  geom_text(aes(label = paste0(tasa_cancelacion, "%")), hjust = -0.1) +
+  coord_flip() +
+  expand_limits(y = 40) +
+  labs(title = "Tasa de cancelacion por canal de distribucion",
+       x = "Canal de distribucion", y = "Tasa de cancelacion (%)") +
+  theme_minimal()
+g_cancel_canal
+ggsave("output/gráficos/10_cancelacion_canal.png", g_cancel_canal, width = 9, height = 6, dpi = 300)
+
+
+# --- Pregunta 2: tasa de cancelacion por deposit_type ---
+cancel_deposito <- hotel_limpio |>
+  group_by(deposit_type) |>
+  summarise(reservas = n(),
+            tasa_cancelacion = round(mean(is_canceled) * 100, 2))
+cancel_deposito
+
+g_cancel_deposito <- ggplot(cancel_deposito, aes(x = reorder(deposit_type, tasa_cancelacion),
+                                                 y = tasa_cancelacion)) +
+  geom_col(fill = "#E67E22") +
+  geom_text(aes(label = paste0(tasa_cancelacion, "%")), hjust = -0.1) +
+  coord_flip() +
+  expand_limits(y = 110) +
+  labs(title = "Tasa de cancelacion por tipo de deposito",
+       x = "Tipo de deposito", y = "Tasa de cancelacion (%)") +
+  theme_minimal()
+g_cancel_deposito
+ggsave("output/gráficos/11_cancelacion_deposito.png", g_cancel_deposito, width = 9, height = 6, dpi = 300)
+
+
+# --- Pregunta 2: tasa de cancelacion por total_of_special_requests ---
+cancel_solicitudes <- hotel_limpio |>
+  group_by(total_of_special_requests) |>
+  summarise(reservas = n(),
+            tasa_cancelacion = round(mean(is_canceled) * 100, 2))
+cancel_solicitudes
+
+g_cancel_solicitudes <- ggplot(cancel_solicitudes, aes(x = total_of_special_requests,
+                                                       y = tasa_cancelacion)) +
+  geom_line(color = "#8E44AD", linewidth = 1) +
+  geom_point(color = "#8E44AD", size = 3) +
+  geom_text(aes(label = paste0(tasa_cancelacion, "%")), vjust = -0.8) +
+  expand_limits(y = 40) +
+  labs(title = "Tasa de cancelacion segun numero de solicitudes especiales",
+       x = "Solicitudes especiales", y = "Tasa de cancelacion (%)") +
+  theme_minimal()
+g_cancel_solicitudes
+ggsave("output/gráficos/12_cancelacion_solicitudes.png", g_cancel_solicitudes, width = 9, height = 6, dpi = 300)
+
+
+# --- Multivariado: canal x solicitudes especiales x cancelacion ---
+g_mapa <- hotel_limpio |>
+  filter(!is.na(distribution_channel)) |>
+  mutate(solicitudes = if_else(total_of_special_requests >= 2, "2+",
+                               as.character(total_of_special_requests))) |>
+  group_by(distribution_channel, solicitudes) |>
+  summarise(tasa_cancelacion = round(mean(is_canceled) * 100, 1), .groups = "drop") |>
+  ggplot(aes(x = solicitudes, y = distribution_channel, fill = tasa_cancelacion)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(tasa_cancelacion, "%"))) +
+  scale_fill_gradient(low = "#E8DAEF", high = "#8E44AD") +
+  labs(title = "Tasa de cancelacion por canal y solicitudes especiales",
+       x = "Solicitudes especiales", y = "Canal de distribucion",
+       fill = "Cancelacion (%)") +
+  theme_minimal()
+g_mapa
+ggsave("output/gráficos/13_mapa_canal_solicitudes.png", g_mapa, width = 9, height = 6, dpi = 300)
+
+
+# ============================================================
+# 3.6 VISUALIZACION TEMPORAL
+# ============================================================
+
+reservas_mes <- hotel_limpio |>
+  mutate(mes_llegada = make_date(arrival_date_year, as.numeric(arrival_date_month), 1)) |>
+  count(mes_llegada, estado_reserva)
+
+g_temporal <- ggplot(reservas_mes, aes(x = mes_llegada, y = n, color = estado_reserva)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("No cancelada" = "#2C7FB8", "Cancelada" = "#E67E22")) +
+  labs(title = "Evolucion mensual de reservas segun estado",
+       x = "Mes de llegada", y = "Numero de reservas", color = "Estado") +
+  theme_minimal()
+g_temporal
+ggsave("output/gráficos/14_temporal_reservas.png", g_temporal, width = 9, height = 6, dpi = 300)
+
+
+# ============================================================
+# 3.7 RESPUESTAS A LAS PREGUNTAS ANALITICAS
+# ============================================================
+
+# --- Pregunta 1: estacionamiento ---
+hotel_limpio |>
+  group_by(tiene_parking) |>
+  summarise(
+    reservas          = n(),
+    porcentaje        = round(n() / nrow(hotel_limpio) * 100, 2),
+    pct_resort        = round(mean(hotel == "Resort Hotel") * 100, 2),
+    mediana_noches    = median(noches_totales),
+    tasa_cancelacion  = round(mean(is_canceled) * 100, 2)
+  )
+
+# --- Pregunta 2: se responde con cancel_canal, cancel_deposito,
+# cancel_solicitudes y el mapa de calor de la seccion 3.5
